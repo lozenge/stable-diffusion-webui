@@ -1,8 +1,9 @@
 import argparse, os, sys, glob, re
 
 from frontend.frontend import draw_gradio_ui
+from frontend.job_manager import JobManager, JobInfo
 from frontend.ui_functions import resize_image
-parser = argparse.ArgumentParser()
+parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 parser.add_argument("--ckpt", type=str, default="models/ldm/stable-diffusion-v1/model.ckpt", help="path to checkpoint of model",)
 parser.add_argument("--cli", type=str, help="don't launch web server, take Python function kwargs from this file.", default=None)
 parser.add_argument("--config", type=str, default="configs/stable-diffusion/v1-inference.yaml", help="path to config which constructs model",)
@@ -36,6 +37,8 @@ parser.add_argument("--share-password", type=str, help="Sharing is open by defau
 parser.add_argument("--share", action='store_true', help="Should share your server on gradio.app, this allows you to use the UI from your mobile app", default=False)
 parser.add_argument("--skip-grid", action='store_true', help="do not save a grid, only individual samples. Helpful when evaluating lots of samples", default=False)
 parser.add_argument("--skip-save", action='store_true', help="do not save indiviual samples. For speed measurements.", default=False)
+parser.add_argument('--no-job-manager', action='store_true', help="Don't use the experimental job manager on top of gradio", default=False)
+parser.add_argument("--max-jobs", type=int, help="Maximum number of concurrent 'generate' commands", default=1)
 opt = parser.parse_args()
 
 #Should not be needed anymore
@@ -44,7 +47,7 @@ opt = parser.parse_args()
 #if opt.extra_models_gpu:
 #    gpus = set([opt.gpu, opt.esrgan_gpu, opt.gfpgan_gpu])
 #    os.environ["CUDA_VISIBLE_DEVICES"] = ','.join(str(g) for g in set(gpus))
-#else: 
+#else:
 #    os.environ["CUDA_VISIBLE_DEVICES"] = str(opt.gpu)
 
 import gradio as gr
@@ -60,7 +63,7 @@ import torch
 import torch.nn as nn
 import yaml
 import glob
-from typing import List, Union
+from typing import List, Union, Dict
 from pathlib import Path
 from collections import namedtuple
 
@@ -103,6 +106,12 @@ LDSR_dir = opt.ldsr_dir
 
 if opt.optimized_turbo:
     opt.optimized = True
+
+if opt.no_job_manager:
+    job_manager = None
+else:
+    job_manager = JobManager(opt.max_jobs)
+    opt.max_jobs += 1 # Leave a free job open for button clicks
 
 # should probably be moved to a settings menu in the UI at some point
 grid_format = [s.lower() for s in opt.grid_format.split(':')]
@@ -294,7 +303,7 @@ def load_GFPGAN():
 
     sys.path.append(os.path.abspath(GFPGAN_dir))
     from gfpgan import GFPGANer
-    
+
     if opt.gfpgan_cpu or opt.extra_models_cpu:
         instance = GFPGANer(model_path=model_path, upscale=1, arch='clean', channel_multiplier=2, bg_upsampler=None, device=torch.device('cpu'))
     elif opt.extra_models_gpu:
@@ -399,7 +408,7 @@ def load_SD_model():
         _, _ = modelCS.load_state_dict(sd, strict=False)
         modelCS.cond_stage_model.device = device
         modelCS.eval()
-            
+
         modelFS = instantiate_from_config(config.modelFirstStage)
         _, _ = modelFS.load_state_dict(sd, strict=False)
         modelFS.eval()
@@ -564,7 +573,7 @@ def check_prompt_length(prompt, comments):
 
     comments.append(f"Warning: too many input tokens; some ({len(overflowing_words)}) have been truncated:\n{overflowing_text}\n")
 
-def save_sample(image, sample_path_i, filename, jpg_sample, prompts, seeds, width, height, steps, cfg_scale, 
+def save_sample(image, sample_path_i, filename, jpg_sample, prompts, seeds, width, height, steps, cfg_scale,
 normalize_prompt_weights, use_GFPGAN, write_info_files, prompt_matrix, init_img, uses_loopback, uses_random_seed_loopback, skip_save,
 skip_grid, sort_samples, sampler_name, ddim_eta, n_iter, batch_size, i, denoising_strength, resize_mode, skip_metadata):
     filename_i = os.path.join(sample_path_i, filename)
@@ -702,7 +711,7 @@ def oxlamon_matrix(prompt, seed, n_iter, batch_size):
                 texts.append( item.text )
                 parts.append( f"Seed: {itemseed}\n" + "\n".join(item.parts) )
                 seeds.append( itemseed )
-                itemseed += 1                
+                itemseed += 1
 
         return seeds, texts, parts
 
@@ -728,7 +737,7 @@ def process_images(
         fp, ddim_eta=0.0, do_not_save_grid=False, normalize_prompt_weights=True, init_img=None, init_mask=None,
         keep_mask=False, mask_blur_strength=3, denoising_strength=0.75, resize_mode=None, uses_loopback=False,
         uses_random_seed_loopback=False, sort_samples=True, write_info_files=True, jpg_sample=False,
-        variant_amount=0.0, variant_seed=None,imgProcessorTask=False):
+        variant_amount=0.0, variant_seed=None,imgProcessorTask=True, job_info: JobInfo = None):
     """this is the main loop that both txt2img and img2img use; it calls func_init once inside all the scopes and func_sample once per batch"""
     assert prompt is not None
     torch_gc()
@@ -790,7 +799,10 @@ def process_images(
         all_seeds = [seed + x for x in range(len(all_prompts))]
 
     precision_scope = autocast if opt.precision == "autocast" else nullcontext
-    output_images = []
+    if job_info:
+        output_images = job_info.images
+    else:
+        output_images = []
     grid_captions = []
     stats = []
     with torch.no_grad(), precision_scope("cuda"), (model.ema_scope() if not opt.optimized else nullcontext()):
@@ -804,17 +816,26 @@ def process_images(
             target_seed_randomizer = seed_to_int('') # random seed
             torch.manual_seed(seed) # this has to be the single starting seed (not per-iteration)
             base_x = create_random_tensors([opt_C, height // opt_f, width // opt_f], seeds=[seed])
-            # we don't want all_seeds to be sequential from starting seed with variants, 
-            # since that makes the same variants each time, 
-            # so we add target_seed_randomizer as a random offset 
+            # we don't want all_seeds to be sequential from starting seed with variants,
+            # since that makes the same variants each time,
+            # so we add target_seed_randomizer as a random offset
             for si in range(len(all_seeds)):
                 all_seeds[si] += target_seed_randomizer
 
         for n in range(n_iter):
+            if job_info and job_info.should_stop.is_set():
+                print("Early exit requested")
+                break
+
             print(f"Iteration: {n+1}/{n_iter}")
             prompts = all_prompts[n * batch_size:(n + 1) * batch_size]
             captions = prompt_matrix_parts[n * batch_size:(n + 1) * batch_size]
             seeds = all_seeds[n * batch_size:(n + 1) * batch_size]
+
+            if job_info:
+                job_info.job_status = f"Processing Iteration {n+1}/{n_iter}. Batch size {batch_size}"
+                for idx,(p,s) in enumerate(zip(prompts,seeds)):
+                    job_info.job_status += f"\nItem {idx}: Seed {s}\nPrompt: {p}"
 
             if opt.optimized:
                 modelCS.to(device)
@@ -847,7 +868,7 @@ def process_images(
                 # we manually generate all input noises because each one should have a specific seed
                 x = create_random_tensors(shape, seeds=seeds)
             else: # we are making variants
-                # using variant_seed as sneaky toggle, 
+                # using variant_seed as sneaky toggle,
                 # when not None or '' use the variant_seed
                 # otherwise use seeds
                 if variant_seed != None and variant_seed != '':
@@ -857,13 +878,13 @@ def process_images(
                 target_x = create_random_tensors(shape, seeds=seeds)
                 # finally, slerp base_x noise to target_x noise for creating a variant
                 x = slerp(device, max(0.0, min(1.0, variant_amount)), base_x, target_x)
-                           
+
             samples_ddim = func_sample(init_data=init_data, x=x, conditioning=c, unconditional_conditioning=uc, sampler_name=sampler_name)
 
             if opt.optimized:
                 modelFS.to(device)
 
-            
+
 
             x_samples_ddim = (model if not opt.optimized else modelFS).decode_first_stage(samples_ddim)
             x_samples_ddim = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0)
@@ -893,7 +914,7 @@ def process_images(
                     gfpgan_sample = restored_img[:,:,::-1]
                     gfpgan_image = Image.fromarray(gfpgan_sample)
                     gfpgan_filename = original_filename + '-gfpgan'
-                    save_sample(gfpgan_image, sample_path_i, gfpgan_filename, jpg_sample, prompts, seeds, width, height, steps, cfg_scale, 
+                    save_sample(gfpgan_image, sample_path_i, gfpgan_filename, jpg_sample, prompts, seeds, width, height, steps, cfg_scale,
 normalize_prompt_weights, use_GFPGAN, write_info_files, prompt_matrix, init_img, uses_loopback, uses_random_seed_loopback, skip_save,
 skip_grid, sort_samples, sampler_name, ddim_eta, n_iter, batch_size, i, denoising_strength, resize_mode, False)
                     output_images.append(gfpgan_image) #287
@@ -909,7 +930,7 @@ skip_grid, sort_samples, sampler_name, ddim_eta, n_iter, batch_size, i, denoisin
                     esrgan_filename = original_filename + '-esrgan4x'
                     esrgan_sample = output[:,:,::-1]
                     esrgan_image = Image.fromarray(esrgan_sample)
-                    save_sample(esrgan_image, sample_path_i, esrgan_filename, jpg_sample, prompts, seeds, width, height, steps, cfg_scale, 
+                    save_sample(esrgan_image, sample_path_i, esrgan_filename, jpg_sample, prompts, seeds, width, height, steps, cfg_scale,
 normalize_prompt_weights, use_GFPGAN, write_info_files, prompt_matrix, init_img, uses_loopback, uses_random_seed_loopback, skip_save,
 skip_grid, sort_samples, sampler_name, ddim_eta, n_iter, batch_size, i, denoising_strength, resize_mode, False)
                     output_images.append(esrgan_image) #287
@@ -927,7 +948,7 @@ skip_grid, sort_samples, sampler_name, ddim_eta, n_iter, batch_size, i, denoisin
                     gfpgan_esrgan_filename = original_filename + '-gfpgan-esrgan4x'
                     gfpgan_esrgan_sample = output[:,:,::-1]
                     gfpgan_esrgan_image = Image.fromarray(gfpgan_esrgan_sample)
-                    save_sample(gfpgan_esrgan_image, sample_path_i, gfpgan_esrgan_filename, jpg_sample, prompts, seeds, width, height, steps, cfg_scale, 
+                    save_sample(gfpgan_esrgan_image, sample_path_i, gfpgan_esrgan_filename, jpg_sample, prompts, seeds, width, height, steps, cfg_scale,
 normalize_prompt_weights, use_GFPGAN, write_info_files, prompt_matrix, init_img, uses_loopback, uses_random_seed_loopback, skip_save,
 skip_grid, sort_samples, sampler_name, ddim_eta, n_iter, batch_size, i, denoising_strength, resize_mode, False)
                     output_images.append(gfpgan_esrgan_image) #287
@@ -939,7 +960,7 @@ skip_grid, sort_samples, sampler_name, ddim_eta, n_iter, batch_size, i, denoisin
                     output_images.append(image)
 
                 if not skip_save:
-                    save_sample(image, sample_path_i, filename, jpg_sample, prompts, seeds, width, height, steps, cfg_scale, 
+                    save_sample(image, sample_path_i, filename, jpg_sample, prompts, seeds, width, height, steps, cfg_scale,
 normalize_prompt_weights, use_GFPGAN, write_info_files, prompt_matrix, init_img, uses_loopback, uses_random_seed_loopback, skip_save,
 skip_grid, sort_samples, sampler_name, ddim_eta, n_iter, batch_size, i, denoising_strength, resize_mode, False)
                     if add_original_image or not simple_templating:
@@ -985,7 +1006,7 @@ skip_grid, sort_samples, sampler_name, ddim_eta, n_iter, batch_size, i, denoisin
         "cfg_scale": cfg_scale,
         "sampler": sampler_name,
     }
-    
+
     full_string = f"{prompt}\n"+ " ".join([f"{k}:" for k,v in args_and_names.items()])
     info = {
         'text': full_string,
@@ -1009,7 +1030,7 @@ Peak memory usage: { -(mem_max_used // -1_048_576) } MiB / { -(mem_total // -1_0
 
 def txt2img(prompt: str, ddim_steps: int, sampler_name: str, toggles: List[int], realesrgan_model_name: str,
             ddim_eta: float, n_iter: int, batch_size: int, cfg_scale: float, seed: Union[int, str, None],
-            height: int, width: int, fp, variant_amount: float = None, variant_seed: int = None):
+            height: int, width: int, fp, variant_amount: float = None, variant_seed: int = None, job_info: JobInfo = None):
     outpath = opt.outdir_txt2img or opt.outdir or "outputs/txt2img-samples"
     err = False
     seed = seed_to_int(seed)
@@ -1078,6 +1099,7 @@ def txt2img(prompt: str, ddim_steps: int, sampler_name: str, toggles: List[int],
             jpg_sample=jpg_sample,
             variant_amount=variant_amount,
             variant_seed=variant_seed,
+            job_info=job_info,
         )
 
         del sampler
@@ -1135,9 +1157,9 @@ class Flagging(gr.FlaggingCallback):
         print("Logged:", filenames[0])
 
 
-def img2img(prompt: str, image_editor_mode: str, init_info, mask_mode: str, mask_blur_strength: int, ddim_steps: int, sampler_name: str,
+def img2img(prompt: str, image_editor_mode: str, init_info: Dict[str,Image.Image], mask_mode: str, mask_blur_strength: int, ddim_steps: int, sampler_name: str,
             toggles: List[int], realesrgan_model_name: str, n_iter: int,  cfg_scale: float, denoising_strength: float,
-            seed: int, height: int, width: int, resize_mode: int, fp = None):
+            seed: int, height: int, width: int, resize_mode: int, fp = None, job_info: JobInfo = None):
     outpath = opt.outdir_img2img or opt.outdir or "outputs/img2img-samples"
     err = False
     seed = seed_to_int(seed)
@@ -1227,7 +1249,7 @@ def img2img(prompt: str, image_editor_mode: str, init_info, mask_mode: str, mask
         init_image = init_image.to(device)
         init_image = repeat(init_image, '1 ... -> b ...', b=batch_size)
         init_latent = (model if not opt.optimized else modelFS).get_first_stage_encoding((model if not opt.optimized else modelFS).encode_first_stage(init_image))  # move to latent space
-        
+
         if opt.optimized:
             mem = torch.cuda.memory_allocated()/1e6
             modelFS.to("cpu")
@@ -1319,6 +1341,7 @@ def img2img(prompt: str, image_editor_mode: str, init_info, mask_mode: str, mask
                 sort_samples=sort_samples,
                 write_info_files=write_info_files,
                 jpg_sample=jpg_sample,
+                job_info=job_info
             )
 
             if initial_seed is None:
@@ -1374,6 +1397,7 @@ def img2img(prompt: str, image_editor_mode: str, init_info, mask_mode: str, mask
             sort_samples=sort_samples,
             write_info_files=write_info_files,
             jpg_sample=jpg_sample,
+            job_info=job_info
         )
 
     del sampler
@@ -1386,10 +1410,10 @@ prompt_parser = re.compile("""
     (?:\\\:|[^:])+  # match one or more non ':' characters or escaped colons '\:'
     )               # end 'prompt'
     (?:             # non-capture group
-    :+              # match one or more ':' characters  
+    :+              # match one or more ':' characters
     (?P<weight>     # capture group for 'weight'
     -?\d+(?:\.\d+)? # match positive or negative integer or decimal number
-    )?              # end weight capture group, make optional 
+    )?              # end weight capture group, make optional
     \s*             # strip spaces after weight
     |               # OR
     $               # else, if no ':' then match end of line
@@ -1414,7 +1438,7 @@ def split_weighted_subprompts(input_string, normalize=True):
 def slerp(device, t, v0:torch.Tensor, v1:torch.Tensor, DOT_THRESHOLD=0.9995):
     v0 = v0.detach().cpu().numpy()
     v1 = v1.detach().cpu().numpy()
-    
+
     dot = np.sum(v0 * v1 / (np.linalg.norm(v0) * np.linalg.norm(v1)))
     if np.abs(dot) > DOT_THRESHOLD:
         v2 = (1 - t) * v0 + t * v1
@@ -1460,15 +1484,15 @@ def imgproc(image,image_batch,imgproc_prompt,imgproc_toggles, imgproc_upscale_to
         if 'x2' in imgproc_realesrgan_model_name:
             # downscale to 1/2 size
             result = result.resize((result.width//2, result.height//2), LANCZOS)
-        
+
         return result
     def processGoBig(image):
         result = processRealESRGAN(image,)
         if 'x4' in imgproc_realesrgan_model_name:
             #downscale to 1/2 size
             result = result.resize((result.width//2, result.height//2), LANCZOS)
-            
-        
+
+
 
         #make sense of parameters
         n_iter = 1
@@ -1485,7 +1509,7 @@ def imgproc(image,image_batch,imgproc_prompt,imgproc_toggles, imgproc_upscale_to
         prompt = imgproc_prompt
         t_enc = int(denoising_strength * ddim_steps)
         sampler_name = imgproc_sampling
-        
+
 
         if sampler_name == 'DDIM':
             sampler = DDIMSampler(model)
@@ -1503,12 +1527,12 @@ def imgproc(image,image_batch,imgproc_prompt,imgproc_toggles, imgproc_upscale_to
             sampler = KDiffusionSampler(model,'lms')
         else:
             raise Exception("Unknown sampler: " + sampler_name)
-            pass     
+            pass
         init_img = result
         init_mask = None
         keep_mask = False
         assert 0. <= denoising_strength <= 1., 'can only work with strength in [0.0, 1.0]'
-        
+
         def init():
             image = init_img.convert("RGB")
             image = resize_image(resize_mode, image, width, height)
@@ -1523,7 +1547,7 @@ def imgproc(image,image_batch,imgproc_prompt,imgproc_toggles, imgproc_upscale_to
             init_image = init_image.to(device)
             init_image = repeat(init_image, '1 ... -> b ...', b=batch_size)
             init_latent = (model if not opt.optimized else modelFS).get_first_stage_encoding((model if not opt.optimized else modelFS).encode_first_stage(init_image))  # move to latent space
-            
+
             if opt.optimized:
                 mem = torch.cuda.memory_allocated()/1e6
                 modelFS.to("cpu")
@@ -1615,7 +1639,7 @@ def imgproc(image,image_batch,imgproc_prompt,imgproc_toggles, imgproc_upscale_to
                 combined_image.paste(combined_row.crop((0, grid.overlap, combined_row.width, h)), (0, y + grid.overlap))
 
             return combined_image
-        
+
         grid = split_grid(result, tile_w=width, tile_h=height, overlap=64)
         work = []
         work_results = []
@@ -1674,13 +1698,12 @@ def imgproc(image,image_batch,imgproc_prompt,imgproc_toggles, imgproc_upscale_to
         combined_image = combine_grid(grid)
         grid_count = len(os.listdir(outpath)) - 1
         del sampler
-        
+
         torch.cuda.empty_cache()
         return combined_image
     def processLDSR(image):
         result = LDSR.superResolution(image,int(imgproc_ldsr_steps),str(imgproc_ldsr_pre_downSample),str(imgproc_ldsr_post_downSample))
-        return result   
-       
+        return result
     if image_batch != None:
         if image != None:
             print("Batch detected and single image detected, please only use one of the two. Aborting.")
@@ -1696,7 +1719,7 @@ def imgproc(image,image_batch,imgproc_prompt,imgproc_toggles, imgproc_upscale_to
             return None
         else:
             images.append(image)
-    
+
     if len(images) > 0:
         print("Processing images...")
         for image in images:
@@ -1708,16 +1731,16 @@ def imgproc(image,image_batch,imgproc_prompt,imgproc_toggles, imgproc_upscale_to
                 os.makedirs(outpathDir, exist_ok=True)
                 batchNumber = get_next_sequence_number(outpathDir)
                 outFilename = str(batchNumber)+'-'+'result'
-                
+
                 if 1 not in imgproc_toggles:
                     output.append(image)
                     save_sample(image, outpathDir, outFilename, False, None, None, None, None, None, None, None, None, None, None, None, None, None, False, None, None, None, None, None, None, None, None, None, True)
-            
+
             if 1 in imgproc_toggles:
                 if imgproc_upscale_toggles == 0:
-                    
+
                     ModelLoader(['model','GFPGAN','LDSR'],False,True) # Unload unused models
-                    ModelLoader(['RealESGAN'],True,False) # Load used models                    
+                    ModelLoader(['RealESGAN'],True,False) # Load used models
                     image = processRealESRGAN(image)
                     outpathDir = os.path.join(outpath,'RealESRGAN')
                     os.makedirs(outpathDir, exist_ok=True)
@@ -1725,7 +1748,7 @@ def imgproc(image,image_batch,imgproc_prompt,imgproc_toggles, imgproc_upscale_to
                     outFilename = str(batchNumber)+'-'+'result'
                     output.append(image)
                     save_sample(image, outpathDir, outFilename, False, None, None, None, None, None, None, None, None, None, None, None, None, None, False, None, None, None, None, None, None, None, None, None, True)
-                
+
                 elif imgproc_upscale_toggles == 1:
 
                     ModelLoader(['GFPGAN','LDSR'],False,True) # Unload unused models
@@ -1749,7 +1772,7 @@ def imgproc(image,image_batch,imgproc_prompt,imgproc_toggles, imgproc_upscale_to
                     outFilename = str(batchNumber)+'-'+'result'
                     output.append(image)
                     save_sample(image, outpathDir, outFilename, False, None, None, None, None, None, None, None, None, None, None, None, None, None, False, None, None, None, None, None, None, None, None, None, True)
-                
+
                 elif imgproc_upscale_toggles == 3:
 
                     ModelLoader(['GFPGAN','LDSR'],False,True) # Unload unused models
@@ -1765,7 +1788,7 @@ def imgproc(image,image_batch,imgproc_prompt,imgproc_toggles, imgproc_upscale_to
                     output.append(image)
                     
                     save_sample(image, outpathDir, outFilename, None, None, None, None, None, None, None, None, None, None, None, None, None, None, False, None, None, None, None, None, None, None, None, None, True)
-    
+
     #LDSR is always unloaded to avoid memory issues
     ModelLoader(['LDSR'],False,True)
     print("Reloading default models...")
@@ -1808,7 +1831,7 @@ def ModelLoader(models,load=False,unload=False):
                 if m =='model':
                     m='Stable Diffusion'
                 print('Loaded ' + m)
-        
+
     torch_gc()
 
 
@@ -2027,7 +2050,8 @@ demo = draw_gradio_ui(opt,
                       GFPGAN=GFPGAN,
                       LDSR=LDSR,
                       run_GFPGAN=run_GFPGAN,
-                      run_RealESRGAN=run_RealESRGAN         
+                      run_RealESRGAN=run_RealESRGAN,
+                      job_manager=job_manager
                         )
 
 class ServerLauncher(threading.Thread):
@@ -2040,17 +2064,17 @@ class ServerLauncher(threading.Thread):
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         gradio_params = {
-            'show_error': True, 
+            'show_error': True,
             'server_name': '0.0.0.0',
-            'server_port': opt.port, 
+            'server_port': opt.port,
             'share': opt.share
         }
         if not opt.share:
-            demo.queue(concurrency_count=1)
+            demo.queue(concurrency_count=opt.max_jobs)
         if opt.share and opt.share_password:
-            gradio_params['auth'] = ('webui', opt.share_password)   
-        
-        # Check to see if Port 7860 is open 
+            gradio_params['auth'] = ('webui', opt.share_password)
+
+        # Check to see if Port 7860 is open
         port_status = 1
         while port_status != 0:
             try:
