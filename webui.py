@@ -728,7 +728,7 @@ def process_images(
         fp, ddim_eta=0.0, do_not_save_grid=False, normalize_prompt_weights=True, init_img=None, init_mask=None,
         keep_mask=False, mask_blur_strength=3, denoising_strength=0.75, resize_mode=None, uses_loopback=False,
         uses_random_seed_loopback=False, sort_samples=True, write_info_files=True, jpg_sample=False,
-        variant_amount=0.0, variant_seed=None,imgProcessorTask=True):
+        variant_amount=0.0, variant_seed=None,imgProcessorTask=False):
     """this is the main loop that both txt2img and img2img use; it calls func_init once inside all the scopes and func_sample once per batch"""
     assert prompt is not None
     torch_gc()
@@ -896,7 +896,7 @@ def process_images(
                     save_sample(gfpgan_image, sample_path_i, gfpgan_filename, jpg_sample, prompts, seeds, width, height, steps, cfg_scale, 
 normalize_prompt_weights, use_GFPGAN, write_info_files, prompt_matrix, init_img, uses_loopback, uses_random_seed_loopback, skip_save,
 skip_grid, sort_samples, sampler_name, ddim_eta, n_iter, batch_size, i, denoising_strength, resize_mode, False)
-                    #output_images.append(gfpgan_image) #287
+                    output_images.append(gfpgan_image) #287
                     #if simple_templating:
                     #    grid_captions.append( captions[i] + "\ngfpgan" )
 
@@ -912,7 +912,7 @@ skip_grid, sort_samples, sampler_name, ddim_eta, n_iter, batch_size, i, denoisin
                     save_sample(esrgan_image, sample_path_i, esrgan_filename, jpg_sample, prompts, seeds, width, height, steps, cfg_scale, 
 normalize_prompt_weights, use_GFPGAN, write_info_files, prompt_matrix, init_img, uses_loopback, uses_random_seed_loopback, skip_save,
 skip_grid, sort_samples, sampler_name, ddim_eta, n_iter, batch_size, i, denoising_strength, resize_mode, False)
-                    #output_images.append(esrgan_image) #287
+                    output_images.append(esrgan_image) #287
                     #if simple_templating:
                     #    grid_captions.append( captions[i] + "\nesrgan" )
 
@@ -930,12 +930,13 @@ skip_grid, sort_samples, sampler_name, ddim_eta, n_iter, batch_size, i, denoisin
                     save_sample(gfpgan_esrgan_image, sample_path_i, gfpgan_esrgan_filename, jpg_sample, prompts, seeds, width, height, steps, cfg_scale, 
 normalize_prompt_weights, use_GFPGAN, write_info_files, prompt_matrix, init_img, uses_loopback, uses_random_seed_loopback, skip_save,
 skip_grid, sort_samples, sampler_name, ddim_eta, n_iter, batch_size, i, denoising_strength, resize_mode, False)
-                    #output_images.append(gfpgan_esrgan_image) #287
+                    output_images.append(gfpgan_esrgan_image) #287
                     #if simple_templating:
                     #    grid_captions.append( captions[i] + "\ngfpgan_esrgan" )
 
-                #if imgProcessorTask == True:
-                #    output_images.append(image)
+                # this flag is used for imgProcessorTasks like GoBig, will return the image without saving it
+                if imgProcessorTask == True:
+                    output_images.append(image)
 
                 if not skip_save:
                     save_sample(image, sample_path_i, filename, jpg_sample, prompts, seeds, width, height, steps, cfg_scale, 
@@ -1432,7 +1433,8 @@ def slerp(device, t, v0:torch.Tensor, v1:torch.Tensor, DOT_THRESHOLD=0.9995):
 
 
 
-def imgproc(image,image_batch,imgproc_prompt,imgproc_toggles, imgproc_upscale_toggles,imgproc_realesrgan_model_name,imgproc_sampling, imgproc_steps, imgproc_height, imgproc_width, imgproc_cfg, imgproc_denoising, imgproc_seed,imgproc_gfpgan_strength):
+def imgproc(image,image_batch,imgproc_prompt,imgproc_toggles, imgproc_upscale_toggles,imgproc_realesrgan_model_name,imgproc_sampling,
+ imgproc_steps, imgproc_height, imgproc_width, imgproc_cfg, imgproc_denoising, imgproc_seed,imgproc_gfpgan_strength,imgproc_ldsr_steps,imgproc_ldsr_pre_downSample,imgproc_ldsr_post_downSample):
 
     outpath = opt.outdir_imglab or opt.outdir or "outputs/imglab-samples"
     output = []
@@ -1676,7 +1678,7 @@ def imgproc(image,image_batch,imgproc_prompt,imgproc_toggles, imgproc_upscale_to
         torch.cuda.empty_cache()
         return combined_image
     def processLDSR(image):
-        result = LDSR.superResolution(image)
+        result = LDSR.superResolution(image,int(imgproc_ldsr_steps),str(imgproc_ldsr_pre_downSample),str(imgproc_ldsr_post_downSample))
         return result   
        
     if image_batch != None:
@@ -1913,13 +1915,12 @@ img2img_toggles = [
     'Write sample info files',
     'jpg samples',
 ]
-"""
 # removed for now becuase of Image Lab implementation
 if GFPGAN is not None:
     img2img_toggles.append('Fix faces using GFPGAN')
 if RealESRGAN is not None:
     img2img_toggles.append('Upscale images using RealESRGAN')
-"""
+
 img2img_mask_modes = [
     "Keep masked area",
     "Regenerate only masked area",
