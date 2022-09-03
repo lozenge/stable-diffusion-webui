@@ -1,9 +1,8 @@
 import argparse, os, sys, glob, re
 
 from frontend.frontend import draw_gradio_ui
-from frontend.job_manager import JobManager, JobInfo
 from frontend.ui_functions import resize_image
-parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+parser = argparse.ArgumentParser()
 parser.add_argument("--ckpt", type=str, default="models/ldm/stable-diffusion-v1/model.ckpt", help="path to checkpoint of model",)
 parser.add_argument("--cli", type=str, help="don't launch web server, take Python function kwargs from this file.", default=None)
 parser.add_argument("--config", type=str, default="configs/stable-diffusion/v1-inference.yaml", help="path to config which constructs model",)
@@ -38,8 +37,6 @@ parser.add_argument("--share-password", type=str, help="Sharing is open by defau
 parser.add_argument("--share", action='store_true', help="Should share your server on gradio.app, this allows you to use the UI from your mobile app", default=False)
 parser.add_argument("--skip-grid", action='store_true', help="do not save a grid, only individual samples. Helpful when evaluating lots of samples", default=False)
 parser.add_argument("--skip-save", action='store_true', help="do not save indiviual samples. For speed measurements.", default=False)
-parser.add_argument('--no-job-manager', action='store_true', help="Don't use the experimental job manager on top of gradio", default=False)
-parser.add_argument("--max-jobs", type=int, help="Maximum number of concurrent 'generate' commands", default=1)
 opt = parser.parse_args()
 
 #Should not be needed anymore
@@ -64,7 +61,7 @@ import torch
 import torch.nn as nn
 import yaml
 import glob
-from typing import List, Union, Dict
+from typing import List, Union
 from pathlib import Path
 from collections import namedtuple
 
@@ -107,12 +104,6 @@ LDSR_dir = opt.ldsr_dir
 
 if opt.optimized_turbo:
     opt.optimized = True
-
-if opt.no_job_manager:
-    job_manager = None
-else:
-    job_manager = JobManager(opt.max_jobs)
-    opt.max_jobs += 1 # Leave a free job open for button clicks
 
 # should probably be moved to a settings menu in the UI at some point
 grid_format = [s.lower() for s in opt.grid_format.split(':')]
@@ -738,7 +729,7 @@ def process_images(
         fp, ddim_eta=0.0, do_not_save_grid=False, normalize_prompt_weights=True, init_img=None, init_mask=None,
         keep_mask=False, mask_blur_strength=3, denoising_strength=0.75, resize_mode=None, uses_loopback=False,
         uses_random_seed_loopback=False, sort_samples=True, write_info_files=True, jpg_sample=False,
-        variant_amount=0.0, variant_seed=None,imgProcessorTask=True, job_info: JobInfo = None):
+        variant_amount=0.0, variant_seed=None,imgProcessorTask=False):
     """this is the main loop that both txt2img and img2img use; it calls func_init once inside all the scopes and func_sample once per batch"""
     assert prompt is not None
     torch_gc()
@@ -800,10 +791,7 @@ def process_images(
         all_seeds = [seed + x for x in range(len(all_prompts))]
 
     precision_scope = autocast if opt.precision == "autocast" else nullcontext
-    if job_info:
-        output_images = job_info.images
-    else:
-        output_images = []
+    output_images = []
     grid_captions = []
     stats = []
     with torch.no_grad(), precision_scope("cuda"), (model.ema_scope() if not opt.optimized else nullcontext()):
@@ -824,19 +812,10 @@ def process_images(
                 all_seeds[si] += target_seed_randomizer
 
         for n in range(n_iter):
-            if job_info and job_info.should_stop.is_set():
-                print("Early exit requested")
-                break
-
             print(f"Iteration: {n+1}/{n_iter}")
             prompts = all_prompts[n * batch_size:(n + 1) * batch_size]
             captions = prompt_matrix_parts[n * batch_size:(n + 1) * batch_size]
             seeds = all_seeds[n * batch_size:(n + 1) * batch_size]
-
-            if job_info:
-                job_info.job_status = f"Processing Iteration {n+1}/{n_iter}. Batch size {batch_size}"
-                for idx,(p,s) in enumerate(zip(prompts,seeds)):
-                    job_info.job_status += f"\nItem {idx}: Seed {s}\nPrompt: {p}"
 
             if opt.optimized:
                 modelCS.to(device)
@@ -1031,7 +1010,7 @@ Peak memory usage: { -(mem_max_used // -1_048_576) } MiB / { -(mem_total // -1_0
 
 def txt2img(prompt: str, ddim_steps: int, sampler_name: str, toggles: List[int], realesrgan_model_name: str,
             ddim_eta: float, n_iter: int, batch_size: int, cfg_scale: float, seed: Union[int, str, None],
-            height: int, width: int, fp, variant_amount: float = None, variant_seed: int = None, job_info: JobInfo = None):
+            height: int, width: int, fp, variant_amount: float = None, variant_seed: int = None):
     outpath = opt.outdir_txt2img or opt.outdir or "outputs/txt2img-samples"
     err = False
     seed = seed_to_int(seed)
@@ -1100,7 +1079,6 @@ def txt2img(prompt: str, ddim_steps: int, sampler_name: str, toggles: List[int],
             jpg_sample=jpg_sample,
             variant_amount=variant_amount,
             variant_seed=variant_seed,
-            job_info=job_info,
         )
 
         del sampler
@@ -1158,9 +1136,9 @@ class Flagging(gr.FlaggingCallback):
         print("Logged:", filenames[0])
 
 
-def img2img(prompt: str, image_editor_mode: str, init_info: Dict[str,Image.Image], mask_mode: str, mask_blur_strength: int, ddim_steps: int, sampler_name: str,
+def img2img(prompt: str, image_editor_mode: str, init_info, mask_mode: str, mask_blur_strength: int, ddim_steps: int, sampler_name: str,
             toggles: List[int], realesrgan_model_name: str, n_iter: int,  cfg_scale: float, denoising_strength: float,
-            seed: int, height: int, width: int, resize_mode: int, fp = None, job_info: JobInfo = None):
+            seed: int, height: int, width: int, resize_mode: int, fp):
     outpath = opt.outdir_img2img or opt.outdir or "outputs/img2img-samples"
     err = False
     seed = seed_to_int(seed)
@@ -1342,7 +1320,6 @@ def img2img(prompt: str, image_editor_mode: str, init_info: Dict[str,Image.Image
                 sort_samples=sort_samples,
                 write_info_files=write_info_files,
                 jpg_sample=jpg_sample,
-                job_info=job_info
             )
 
             if initial_seed is None:
@@ -1398,7 +1375,6 @@ def img2img(prompt: str, image_editor_mode: str, init_info: Dict[str,Image.Image
             sort_samples=sort_samples,
             write_info_files=write_info_files,
             jpg_sample=jpg_sample,
-            job_info=job_info
         )
 
     del sampler
@@ -2052,8 +2028,7 @@ demo = draw_gradio_ui(opt,
                       LDSR=LDSR,
                       run_GFPGAN=run_GFPGAN,
                       run_RealESRGAN=run_RealESRGAN,
-                      job_manager=job_manager
-                        )
+                      )
 
 class ServerLauncher(threading.Thread):
     def __init__(self, demo):
@@ -2072,7 +2047,7 @@ class ServerLauncher(threading.Thread):
             'show_error': True
         }
         if not opt.share:
-            demo.queue(concurrency_count=opt.max_jobs)
+            demo.queue(concurrency_count=1)
         if opt.share and opt.share_password:
             gradio_params['auth'] = ('webui', opt.share_password)
 

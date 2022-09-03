@@ -3,9 +3,7 @@ from tkinter.filedialog import askopenfilename
 from email.policy import default
 import gradio as gr
 from frontend.css_and_js import css, js, call_JS, js_parse_prompt, js_copy_txt2img_output
-from frontend.job_manager import JobManager
 import frontend.ui_functions as uifn
-import uuid
 
 try:
     import pyperclip
@@ -13,11 +11,11 @@ except ImportError:
     print("Warning: pyperclip is not installed. Pasting settings is unavailable.", file=sys.stderr)
     pyperclip = None
 
+
 def draw_gradio_ui(opt, img2img=lambda x: x, txt2img=lambda x: x,imgproc=lambda x: x, txt2img_defaults={}, RealESRGAN=True, GFPGAN=True,LDSR=True,
                    txt2img_toggles={}, txt2img_toggle_defaults='k_euler', show_embeddings=False, img2img_defaults={},
                    img2img_toggles={}, img2img_toggle_defaults={}, sample_img2img=None, img2img_mask_modes=None,
-                   img2img_resize_modes=None, imgproc_defaults={},imgproc_mode_toggles={},user_defaults={}, run_GFPGAN=lambda x: x, run_RealESRGAN=lambda x: x,
-                   job_manager: JobManager = None) -> gr.Blocks:
+                   img2img_resize_modes=None, imgproc_defaults={},imgproc_mode_toggles={},user_defaults={}, run_GFPGAN=lambda x: x, run_RealESRGAN=lambda x: x):
 
     with gr.Blocks(css=css(opt), analytics_enabled=False, title="Stable Diffusion WebUI") as demo:
         with gr.Tabs(elem_id='tabss') as tabs:
@@ -45,27 +43,6 @@ def draw_gradio_ui(opt, img2img=lambda x: x, txt2img=lambda x: x,imgproc=lambda 
                         txt2img_batch_count = gr.Slider(minimum=1, maximum=50, step=1,
                                                         label='Number of images to generate',
                                                         value=txt2img_defaults['n_iter'])
-
-                        if job_manager is not None:
-                            with gr.Tabs():
-                                with gr.TabItem("Current Session"):
-                                    with gr.Row():
-                                        txt2img_stop_btn = gr.Button("Stop", elem_id="stop", variant="secondary")
-                                        txt2img_refresh_btn = gr.Button(
-                                            "Refresh", elem_id="refresh", variant="secondary")
-                                    txt2img_job_status = gr.Textbox(
-                                        placeholder="Job Status", interactive=False, show_label=False)
-                                with gr.TabItem("Maintenance"):
-                                    with gr.Row():
-                                        gr.Markdown("Stop all concurrent sessions, or free memory associated with jobs which were finished after the browser was closed")
-                                    with gr.Row():
-                                        txt2img_stop_all_sessions = gr.Button(
-                                            "Stop All Sessions", elem_id="stop_all", variant="secondary"
-                                        )
-                                        txt2img_free_done_sessions = gr.Button(
-                                            "Clear Finished Jobs", elem_id="clear_finished", variant="secondary"
-                                        )
-
                         txt2img_dimensions_info_text_box = gr.Textbox(label="Aspect ratio (4:3 = 1.333 | 16:9 = 1.777 | 21:9 = 2.333)")
                     with gr.Column():
                         with gr.Box():
@@ -137,45 +114,19 @@ def draw_gradio_ui(opt, img2img=lambda x: x, txt2img=lambda x: x,imgproc=lambda 
                         txt2img_embeddings = gr.File(label="Embeddings file for textual inversion",
                                                      visible=show_embeddings)
 
-                if job_manager:
-                    txt2img_stop_all_sessions.click(
-                        job_manager.stop_all_jobs,
-                        [],
-                        []
-                    )
-                    txt2img_free_done_sessions.click(
-                        job_manager.clear_all_finished_jobs,
-                        [],
-                        []
-                    )
-
-                # If a JobManager was passed in then wrap the Generate functions
-                txt2img_func = txt2img
-                txt2img_inputs = [txt2img_prompt, txt2img_steps, txt2img_sampling, txt2img_toggles,
-                                  txt2img_realesrgan_model_name, txt2img_ddim_eta, txt2img_batch_count,
-                                  txt2img_batch_size, txt2img_cfg, txt2img_seed, txt2img_height, txt2img_width,
-                                  txt2img_embeddings, txt2img_variant_amount, txt2img_variant_seed]
-                txt2img_outputs = [output_txt2img_gallery, output_txt2img_seed,
-                                   output_txt2img_params, output_txt2img_stats]
-                if job_manager:
-                    txt2img_func, txt2img_inputs, txt2img_outputs = job_manager.wrap_func(
-                        func=txt2img_func,
-                        inputs=txt2img_inputs,
-                        outputs=txt2img_outputs,
-                        refresh_btn=txt2img_refresh_btn,
-                        stop_btn=txt2img_stop_btn,
-                        status_text=txt2img_job_status
-                    )
-
                 txt2img_btn.click(
-                    txt2img_func,
-                    txt2img_inputs,
-                    txt2img_outputs
+                    txt2img,
+                    [txt2img_prompt, txt2img_steps, txt2img_sampling, txt2img_toggles, txt2img_realesrgan_model_name,
+                     txt2img_ddim_eta, txt2img_batch_count, txt2img_batch_size, txt2img_cfg, txt2img_seed,
+                     txt2img_height, txt2img_width, txt2img_embeddings, txt2img_variant_amount, txt2img_variant_seed],
+                    [output_txt2img_gallery, output_txt2img_seed, output_txt2img_params, output_txt2img_stats]
                 )
                 txt2img_prompt.submit(
-                    txt2img_func,
-                    txt2img_inputs,
-                    txt2img_outputs
+                    txt2img,
+                    [txt2img_prompt, txt2img_steps, txt2img_sampling, txt2img_toggles, txt2img_realesrgan_model_name,
+                     txt2img_ddim_eta, txt2img_batch_count, txt2img_batch_size, txt2img_cfg, txt2img_seed,
+                     txt2img_height, txt2img_width, txt2img_embeddings, txt2img_variant_amount, txt2img_variant_seed],
+                    [output_txt2img_gallery, output_txt2img_seed, output_txt2img_params, output_txt2img_stats]
                 )
                 txt2img_width.change(fn=uifn.update_dimensions_info, inputs=[txt2img_width, txt2img_height], outputs=txt2img_dimensions_info_text_box)
                 txt2img_height.change(fn=uifn.update_dimensions_info, inputs=[txt2img_width, txt2img_height], outputs=txt2img_dimensions_info_text_box)
@@ -209,8 +160,6 @@ def draw_gradio_ui(opt, img2img=lambda x: x, txt2img=lambda x: x,imgproc=lambda 
                     outputs=txt2img_settings_elements
                 )
 
-                # txt2img_width.change(fn=uifn.update_dimensions_info, inputs=[txt2img_width, txt2img_height], outputs=txt2img_dimensions_info_text_box)
-                # txt2img_height.change(fn=uifn.update_dimensions_info, inputs=[txt2img_width, txt2img_height], outputs=txt2img_dimensions_info_text_box)
                 live_prompt_params = [txt2img_prompt, txt2img_width, txt2img_height, txt2img_steps, txt2img_seed, txt2img_batch_count, txt2img_cfg]
                 txt2img_prompt.change(
                     fn=None,
@@ -218,7 +167,6 @@ def draw_gradio_ui(opt, img2img=lambda x: x, txt2img=lambda x: x,imgproc=lambda 
                     outputs=live_prompt_params,
                     _js=js_parse_prompt
                 )
-
 
             with gr.TabItem("Image-to-Image Unified", id="img2img_tab"):
                 with gr.Row(elem_id="prompt_row"):
@@ -245,7 +193,7 @@ def draw_gradio_ui(opt, img2img=lambda x: x, txt2img=lambda x: x,imgproc=lambda 
 
                         with gr.Tabs():
                             with gr.TabItem("Editor Options"):
-                                with gr.Row():
+                                with gr.Column():
                                     img2img_image_editor_mode = gr.Radio(choices=["Mask", "Crop", "Uncrop"], label="Image Editor Mode",
                                                              value="Crop", elem_id='edit_mode_select')
                                     img2img_mask = gr.Radio(choices=["Keep masked area", "Regenerate only masked area"],
@@ -269,25 +217,6 @@ def draw_gradio_ui(opt, img2img=lambda x: x, txt2img=lambda x: x,imgproc=lambda 
                     with gr.Column():
                         gr.Markdown('#### Img2Img Results')
                         output_img2img_gallery = gr.Gallery(label="Images", elem_id="img2img_gallery_output").style(grid=[4,4,4])
-                        if job_manager is not None:
-                            with gr.Tabs():
-                                with gr.TabItem("Current Session"):
-                                    with gr.Row():
-                                        img2img_stop_btn = gr.Button("Stop", elem_id="stop", variant="secondary")
-                                        img2img_refresh_btn = gr.Button(
-                                            "Refresh", elem_id="refresh", variant="secondary")
-                                    img2img_job_status = gr.Textbox(
-                                        placeholder="Job Status", interactive=False, show_label=False)
-                                with gr.TabItem("Maintenance"):
-                                    with gr.Row():
-                                        gr.Markdown("Stop all concurrent sessions, or free memory associated with jobs which were finished after the browser was closed")
-                                    with gr.Row():
-                                        img2img_stop_all_sessions = gr.Button(
-                                            "Stop All Sessions", elem_id="stop_all", variant="secondary"
-                                        )
-                                        img2img_free_done_sessions = gr.Button(
-                                            "Clear Finished Jobs", elem_id="clear_finished", variant="secondary"
-                                        )
                         with gr.Tabs():
                             with gr.TabItem("Generated image actions", id="img2img_actions_tab"):
                                 gr.Markdown("Select an image, then press one of the buttons below")
@@ -394,46 +323,24 @@ def draw_gradio_ui(opt, img2img=lambda x: x, txt2img=lambda x: x,imgproc=lambda 
                                                                        fromId="img2img_gallery_output")
                                                            )
 
-                if job_manager:
-                    img2img_stop_all_sessions.click(
-                        job_manager.stop_all_jobs,
-                        [],
-                        []
-                    )
-                    img2img_free_done_sessions.click(
-                        job_manager.clear_all_finished_jobs,
-                        [],
-                        []
-                    )
-
-                # If a JobManager was passed in then wrap the Generate functions
-                img2img_func = img2img
-                img2img_inputs = [img2img_prompt, img2img_image_editor_mode, img2img_image_editor, img2img_mask,
-                                  img2img_mask_blur_strength, img2img_steps, img2img_sampling, img2img_toggles,
-                                  img2img_realesrgan_model_name, img2img_batch_count, img2img_cfg,
-                                  img2img_denoising, img2img_seed, img2img_height, img2img_width, img2img_resize,
-                                  img2img_embeddings]
-                img2img_outputs = [output_img2img_gallery, output_img2img_seed, output_img2img_params, output_img2img_stats]
-
-                if job_manager:
-                    img2img_func, img2img_inputs, img2img_outputs = job_manager.wrap_func(
-                        func=img2img_func,
-                        inputs=img2img_inputs,
-                        outputs=img2img_outputs,
-                        refresh_btn=img2img_refresh_btn,
-                        stop_btn=img2img_stop_btn,
-                        status_text=img2img_job_status
-                    )
-
                 img2img_btn_mask.click(
-                    img2img_func,
-                    img2img_inputs,
-                    img2img_outputs
+                    img2img,
+                    [img2img_prompt, img2img_image_editor_mode, img2img_image_mask, img2img_mask,
+                     img2img_mask_blur_strength, img2img_steps, img2img_sampling, img2img_toggles,
+                     img2img_realesrgan_model_name, img2img_batch_count, img2img_cfg,
+                     img2img_denoising, img2img_seed, img2img_height, img2img_width, img2img_resize,
+                     img2img_embeddings],
+                    [output_img2img_gallery, output_img2img_seed, output_img2img_params, output_img2img_stats]
                 )
+
                 def img2img_submit_params():
-                    return (img2img_func,
-                    img2img_inputs,
-                    img2img_outputs)
+                    return (img2img,
+                            [img2img_prompt, img2img_image_editor_mode, img2img_image_editor, img2img_mask,
+                             img2img_mask_blur_strength, img2img_steps, img2img_sampling, img2img_toggles,
+                             img2img_realesrgan_model_name, img2img_batch_count, img2img_cfg,
+                             img2img_denoising, img2img_seed, img2img_height, img2img_width, img2img_resize,
+                             img2img_embeddings],
+                            [output_img2img_gallery, output_img2img_seed, output_img2img_params, output_img2img_stats])
 
                 img2img_btn_editor.click(*img2img_submit_params())
 
